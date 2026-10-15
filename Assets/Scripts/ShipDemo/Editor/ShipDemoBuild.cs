@@ -4,7 +4,7 @@ using UnityEngine;
 
 /// <summary>
 /// Builds for the ship demo. Usable from the menu or the command line:
-///   Unity.exe -batchmode -quit -projectPath "D:\Unity\FishNet" -executeMethod ShipDemoBuild.BuildServer -logFile -
+///   Unity.exe -batchmode -quit -projectPath "C:\Projects\Unity\ship-demo" -executeMethod ShipDemoBuild.BuildServer -logFile -
 /// </summary>
 public static class ShipDemoBuild
 {
