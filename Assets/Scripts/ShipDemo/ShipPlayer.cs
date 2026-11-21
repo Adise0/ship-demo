@@ -20,10 +20,30 @@ public struct ShipPlayerInput : IReplicateData
     public Quaternion Look;
     public int LookFrame;
 
+    // Seats: F enters/leaves the helm or a fighter.
+    public bool Interact;
+    // Fighter: Q/E (Roll axis) strafes, Z/C yaw, mouse aim in degrees this tick (pitch down,
+    // yaw right), X engine, R release. A/D roll comes from Move.
+    public float Roll;
+    public float Yaw;
+    public Vector2 Steer;
+    public bool EngineToggle;
+    public bool Release;
+    // Helm: the command the seated player wants. A new sequence number marks a change.
+    public HelmCommand Helm;
+    public byte HelmSequence;
+
     private uint _tick;
     public void Dispose() { }
     public uint GetTick() => _tick;
     public void SetTick(uint value) => _tick = value;
+}
+
+public enum PlayerSeat : byte
+{
+    None,
+    Helm,
+    Fighter,
 }
 
 public struct ShipPlayerState : IReconcileData
@@ -36,6 +56,11 @@ public struct ShipPlayerState : IReconcileData
     public Vector3 Velocity;
     public bool BootsOn;
     public bool Attached;
+    public PlayerSeat Seat;
+    // Ship id for the helm, fighter id for a fighter.
+    public int SeatTarget;
+    // The piloted fighter's state, when Seat is Fighter.
+    public FighterState Fighter;
 
     private uint _tick;
     public void Dispose() { }
@@ -49,6 +74,8 @@ public struct ShipPlayerState : IReconcileData
 ///   ship gravity here        -> walk, down = gravity
 ///   mag boots on a surface   -> walk on that surface, down = into the surface
 ///   otherwise                -> float (thrusters), feeling the ship's motion as fictitious forces
+/// Seated at a ship's helm the body is held in the seat and the player's input flies the ship.
+/// Seated in a fighter the body rides along and the fighter is simulated as part of this player.
 /// The physics body is a separate object that moves between physics scenes; this object only renders it.
 /// </summary>
 public class ShipPlayer : NetworkBehaviour
@@ -60,6 +87,7 @@ public class ShipPlayer : NetworkBehaviour
         Float,
         Walk,
         Boots,
+        Seated,
     }
 
     [Header("Walking")]
@@ -117,22 +145,57 @@ public class ShipPlayer : NetworkBehaviour
     [SerializeField]
     private float _rollSpeed = 90f;
 
+    [Header("Helm")]
+    // Throttle change per second while W/S is held.
+    [SerializeField]
+    private float _throttleRate = 8f;
+    // Throttle is sent in steps of this, so holding W doesn't send a new command every tick.
+    [SerializeField]
+    private float _throttleStep = 0.5f;
+
     private Rigidbody _body;
+    private CapsuleCollider _capsule;
     private int _frame = WorldFrame;
     private Scene _worldScene;
     // Simulation state beyond the rigidbody; reconciled.
     private bool _bootsOn;
     private bool _attached;
+    private PlayerSeat _seat;
+    private int _seatTarget;
     // Derived each tick from the state above; not reconciled.
     private MoveMode _mode;
 
     private InputSystem_Actions _inputActions;
-    // Controls not in the shared input asset: Q/E roll, Ctrl down, B boots.
+    // Controls not in the shared input asset: Q/E roll (strafe in a fighter), Ctrl down, B boots,
+    // F interact, X engine, R release, Z/C yaw, right mouse free look.
     private InputAction _rollAction;
+    private InputAction _yawAction;
     private InputAction _downAction;
     private InputAction _bootsAction;
+    private InputAction _interactAction;
+    private InputAction _engineAction;
+    private InputAction _releaseAction;
+    private InputAction _freeLookAction;
     private bool _jumpPressed;
     private bool _bootsPressed;
+    private bool _interactPressed;
+    private bool _enginePressed;
+    private bool _releasePressed;
+
+    // Helm controls on the owner. The throttle persists; the command goes out with every input.
+    private float _helmThrottle;
+    private HelmCommand _helmCommand;
+    private byte _helmSequence;
+    // Last helm sequence scheduled: by the server for this player, and predicted by the owner.
+    private byte _serverHelmSequence;
+    private byte _predictedHelmSequence;
+
+    // Fighter controls on the owner: mouse movement since the last tick steers; Alt turns the
+    // head instead, which eases back when released.
+    private Vector2 _steerDegrees;
+    private Quaternion _headLook = Quaternion.identity;
+    private float _headYaw;
+    private float _headPitch;
 
     // Owner camera. _lookRot is the view in _lookFrame's space. While walking (gravity or boots)
     // it's yaw/pitch around the body's up; while floating it's a free rotation.
@@ -155,9 +218,12 @@ public class ShipPlayer : NetworkBehaviour
         public Vector3 Position;
         public Quaternion Rotation;
         public MoveMode Mode;
+        public PlayerSeat Seat;
+        public int SeatTarget;
     }
     private Snapshot _previous;
     private Snapshot _current;
+    private Renderer[] _renderers;
 
     private void Awake()
     {
@@ -169,15 +235,25 @@ public class ShipPlayer : NetworkBehaviour
             .With("Positive", "<Keyboard>/q");
         _downAction = new InputAction("Down", InputActionType.Button, "<Keyboard>/leftCtrl");
         _bootsAction = new InputAction("Boots", InputActionType.Button, "<Keyboard>/b");
+        _interactAction = new InputAction("Interact", InputActionType.Button, "<Keyboard>/f");
+        _engineAction = new InputAction("Engine", InputActionType.Button, "<Keyboard>/x");
+        _releaseAction = new InputAction("Release", InputActionType.Button, "<Keyboard>/r");
+        // Not Alt: on Windows a lone Alt press focuses the window's menu bar and steals input.
+        _freeLookAction = new InputAction("FreeLook", InputActionType.Button, "<Mouse>/rightButton");
+        _yawAction = new InputAction("Yaw", InputActionType.Value);
+        _yawAction.AddCompositeBinding("1DAxis")
+            .With("Negative", "<Keyboard>/z")
+            .With("Positive", "<Keyboard>/c");
     }
 
     private void OnDestroy()
     {
         _inputActions?.Dispose();
-        _rollAction?.Dispose();
-        _downAction?.Dispose();
-        _bootsAction?.Dispose();
+        foreach (InputAction action in ExtraActions)
+            action?.Dispose();
     }
+
+    private InputAction[] ExtraActions => new[] { _rollAction, _yawAction, _downAction, _bootsAction, _interactAction, _engineAction, _releaseAction, _freeLookAction };
 
     public override void OnStartNetwork()
     {
@@ -212,6 +288,9 @@ public class ShipPlayer : NetworkBehaviour
         TimeManager.OnPostTick -= TimeManager_OnPostTick;
         PredictionManager.OnPostReconcile -= PredictionManager_OnPostReconcile;
 
+        // Leaving (e.g. disconnecting) frees the seat; a fighter parks where it is.
+        LeaveSeat(placeBody: false);
+
         if (_body != null)
             Destroy(_body.gameObject);
     }
@@ -222,9 +301,8 @@ public class ShipPlayer : NetworkBehaviour
             return;
 
         _inputActions.Player.Enable();
-        _rollAction.Enable();
-        _downAction.Enable();
-        _bootsAction.Enable();
+        foreach (InputAction action in ExtraActions)
+            action.Enable();
         if (Camera.main != null)
             _camera = Camera.main.transform;
         _lookFrame = _frame;
@@ -238,9 +316,8 @@ public class ShipPlayer : NetworkBehaviour
     public override void OnStopClient()
     {
         _inputActions.Player.Disable();
-        _rollAction.Disable();
-        _downAction.Disable();
-        _bootsAction.Disable();
+        foreach (InputAction action in ExtraActions)
+            action.Disable();
         if (IsOwner)
         {
             Cursor.lockState = CursorLockMode.None;
@@ -252,12 +329,15 @@ public class ShipPlayer : NetworkBehaviour
     {
         GameObject go = new($"{name}_Body");
         UnitySceneManager.MoveGameObjectToScene(go, _worldScene);
+        // The new body is in the world scene, whatever frame a previous session left this in.
+        _frame = WorldFrame;
+        _seat = PlayerSeat.None;
 
-        CapsuleCollider capsule = go.AddComponent<CapsuleCollider>();
-        capsule.radius = _radius;
-        capsule.height = _height;
+        _capsule = go.AddComponent<CapsuleCollider>();
+        _capsule.radius = _radius;
+        _capsule.height = _height;
         // Frictionless so the player doesn't stick to walls; walking handles its own grip.
-        capsule.sharedMaterial = new PhysicsMaterial("Player")
+        _capsule.sharedMaterial = new PhysicsMaterial("Player")
         {
             dynamicFriction = 0f,
             staticFriction = 0f,
@@ -310,6 +390,15 @@ public class ShipPlayer : NetworkBehaviour
             _jumpPressed = true;
         if (_bootsAction.WasPressedThisFrame())
             _bootsPressed = true;
+        if (_interactAction.WasPressedThisFrame())
+            _interactPressed = true;
+        if (_engineAction.WasPressedThisFrame())
+            _enginePressed = true;
+        if (_releaseAction.WasPressedThisFrame())
+            _releasePressed = true;
+
+        if (_seat == PlayerSeat.Helm)
+            UpdateHelm();
 
         if (Keyboard.current != null && Keyboard.current.escapeKey.wasPressedThisFrame)
         {
@@ -331,6 +420,15 @@ public class ShipPlayer : NetworkBehaviour
             delta *= _stickSensitivity * Time.deltaTime;
         if (Cursor.lockState != CursorLockMode.Locked)
             delta = Vector2.zero;
+
+        if (_current.Seat == PlayerSeat.Fighter)
+        {
+            UpdateFighterLook(delta);
+            return;
+        }
+        _headLook = Quaternion.identity;
+        _headYaw = _headPitch = 0f;
+        _steerDegrees = Vector2.zero;
 
         // The rendered body changed frame: carry the view over through world space so it doesn't snap.
         if (_current.Frame != _lookFrame)
@@ -364,6 +462,69 @@ public class ShipPlayer : NetworkBehaviour
         }
 
         _lookWorld = RenderFrameRotation(_lookFrame) * _lookRot;
+    }
+
+    /// <summary>
+    /// In a fighter the mouse steers; with Alt held it turns the head instead (e.g. to look up
+    /// through the canopy at the hatch), and the head eases back forward when Alt is let go.
+    /// </summary>
+    private void UpdateFighterLook(Vector2 delta)
+    {
+        Fighter fighter = Fighter.Get(_current.SeatTarget);
+        if (fighter == null)
+            return;
+
+        if (_freeLookAction.IsPressed())
+        {
+            _headYaw = Mathf.Clamp(_headYaw + delta.x, -150f, 150f);
+            _headPitch = Mathf.Clamp(_headPitch - delta.y, -85f, 85f);
+            _headLook = Quaternion.Euler(_headPitch, _headYaw, 0f);
+        }
+        else
+        {
+            _steerDegrees += delta;
+            _headLook = Quaternion.RotateTowards(_headLook, Quaternion.identity, 360f * Time.deltaTime);
+            Vector3 euler = _headLook.eulerAngles;
+            _headPitch = Mathf.DeltaAngle(0f, euler.x);
+            _headYaw = Mathf.DeltaAngle(0f, euler.y);
+        }
+
+        fighter.GetRenderPose(out _, out Quaternion fighterRot);
+        _lookWorld = fighterRot * _headLook;
+        // Keep the walking/floating view in step, so stepping out continues from this view.
+        _lookFrame = _current.Frame;
+        _lookRot = Quaternion.Inverse(RenderFrameRotation(_lookFrame)) * _lookWorld;
+        _lookUpright = false;
+    }
+
+    /// <summary>
+    /// Helm controls: W/S move the throttle (it stays where it's left), Shift all stop,
+    /// A/D yaw, Space/Ctrl pitch, Q/E roll.
+    /// </summary>
+    private void UpdateHelm()
+    {
+        ShipFrame ship = ShipFrame.Get(_seatTarget);
+        if (ship == null)
+            return;
+
+        var player = _inputActions.Player;
+        Vector2 move = player.Move.ReadValue<Vector2>();
+        _helmThrottle = Mathf.Clamp(_helmThrottle + move.y * _throttleRate * Time.deltaTime, -ship.MaxReverseSpeed, ship.MaxSpeed);
+        if (player.Sprint.IsPressed())
+            _helmThrottle = 0f;
+
+        float pitch = (_downAction.IsPressed() ? 1f : 0f) - (player.Jump.IsPressed() ? 1f : 0f);
+        HelmCommand command = new()
+        {
+            Speed = Mathf.Round(_helmThrottle / _throttleStep) * _throttleStep,
+            Turn = new Vector3(pitch, Mathf.Round(move.x), _rollAction.ReadValue<float>()),
+        };
+        if (!command.Equals(_helmCommand) || _helmSequence == 0)
+        {
+            _helmCommand = command;
+            // 0 is reserved for commands the server makes itself.
+            _helmSequence = (byte)(_helmSequence == byte.MaxValue ? 1 : _helmSequence + 1);
+        }
     }
 
     /// <summary>
@@ -420,9 +581,40 @@ public class ShipPlayer : NetworkBehaviour
             BootsToggle = _bootsPressed,
             Look = _lookRot,
             LookFrame = _lookFrame,
+            Interact = _interactPressed,
+            Roll = _rollAction.ReadValue<float>(),
+            EngineToggle = _enginePressed,
+            Release = _releasePressed,
         };
+
+        Fighter fighter = _seat == PlayerSeat.Fighter ? Fighter.Get(_seatTarget) : null;
+        if (fighter != null)
+        {
+            // Mouse aim: send what the fighter can turn this tick, and carry the rest over so a
+            // quick flick still turns all the way, just at the fighter's turn rate.
+            Vector2 max = fighter.MaxAimPerTick((float)TimeManager.TickDelta);
+            Vector2 aim = new(Mathf.Clamp(-_steerDegrees.y, -max.x, max.x), Mathf.Clamp(_steerDegrees.x, -max.y, max.y));
+            data.Steer = aim;
+            data.Yaw = _yawAction.ReadValue<float>();
+            _steerDegrees -= new Vector2(aim.y, -aim.x);
+            _steerDegrees = Vector2.ClampMagnitude(_steerDegrees, 45f);
+        }
+        else
+        {
+            _steerDegrees = Vector2.zero;
+        }
+
+        if (_seat == PlayerSeat.Helm)
+        {
+            data.Helm = _helmCommand;
+            data.HelmSequence = _helmSequence;
+        }
+
         _jumpPressed = false;
         _bootsPressed = false;
+        _interactPressed = false;
+        _enginePressed = false;
+        _releasePressed = false;
         return data;
     }
     #endregion
@@ -438,6 +630,19 @@ public class ShipPlayer : NetworkBehaviour
         float delta = (float)TimeManager.TickDelta;
         // Body state is currently the result of the previous tick.
         long previousTick = ShipClock.SimTick - 1;
+
+        if (data.Interact)
+            Interact(state);
+
+        switch (_seat)
+        {
+            case PlayerSeat.Helm:
+                SimulateHelm(data, state);
+                return;
+            case PlayerSeat.Fighter:
+                SimulateFighter(data, previousTick, delta);
+                return;
+        }
 
         if (data.BootsToggle)
             _bootsOn = !_bootsOn;
@@ -457,6 +662,179 @@ public class ShipPlayer : NetworkBehaviour
             SimulateInShip(data, look, previousTick, delta);
         }
     }
+
+    #region Seats.
+    /// <summary>
+    /// F: leaves the current seat, or takes the helm or a fighter within reach. The server's
+    /// occupancy decides; a client that predicted taking a seat someone else got is corrected out.
+    /// </summary>
+    private void Interact(ReplicateState state)
+    {
+        if (_seat != PlayerSeat.None)
+        {
+            LeaveSeat(placeBody: true);
+            return;
+        }
+
+        ShipHelm helm = ShipHelm.ForShip(_frame);
+        if (helm != null && helm.IsFreeFor(ObjectId)
+            && Vector3.Distance(_body.position, helm.SeatLocal) <= helm.InteractDistance)
+        {
+            _seat = PlayerSeat.Helm;
+            _seatTarget = helm.Ship.Id;
+            SetSeated(true);
+            if (IsServerStarted)
+                helm.SetOccupant(ObjectId);
+            // Pick up the throttle where the ship is, once (not again on replays).
+            if (IsOwner && !state.ContainsReplayed())
+                _helmThrottle = helm.Ship.CommandAt(ShipClock.SimTick).Speed;
+            return;
+        }
+
+        foreach (Fighter fighter in Fighter.All)
+        {
+            if (fighter.Frame != _frame || !fighter.IsFreeFor(ObjectId)
+                || Vector3.Distance(_body.position, fighter.Position) > fighter.BoardDistance)
+                continue;
+
+            _seat = PlayerSeat.Fighter;
+            _seatTarget = fighter.Id;
+            SetSeated(true);
+            fighter.BeginPiloting(this);
+            FollowFighter(fighter);
+            return;
+        }
+    }
+
+    /// <summary>
+    /// Gets up from the current seat. placeBody puts the body back in the world (beside the
+    /// fighter, or standing at the helm); without it (despawning) only the seat is freed.
+    /// Returns false if the seat can't be left right now (a fighter mid-capture).
+    /// </summary>
+    private bool LeaveSeat(bool placeBody)
+    {
+        switch (_seat)
+        {
+            case PlayerSeat.Helm:
+                ShipHelm helm = ShipHelm.ForShip(_seatTarget);
+                if (helm != null && IsServerStarted)
+                {
+                    helm.SetOccupant(-1);
+                    helm.ScheduleNeutral();
+                }
+                break;
+            case PlayerSeat.Fighter:
+                Fighter fighter = Fighter.Get(_seatTarget);
+                if (fighter != null)
+                {
+                    if (placeBody && !fighter.CanExit)
+                        return false;
+                    if (placeBody)
+                    {
+                        SetSeated(false);
+                        SetFrame(fighter.Frame);
+                        SetBody(fighter.ExitPosition, fighter.Rotation, fighter.Velocity);
+                    }
+                    fighter.EndPiloting(this);
+                }
+                break;
+            default:
+                return true;
+        }
+
+        _seat = PlayerSeat.None;
+        if (_body != null)
+            SetSeated(false);
+        return true;
+    }
+
+    /// <summary>
+    /// Seated, the body is held in place by the seat: no collisions, no physics.
+    /// </summary>
+    private void SetSeated(bool seated)
+    {
+        if (seated && !_body.isKinematic)
+            _body.linearVelocity = Vector3.zero;
+        _body.isKinematic = seated;
+        _capsule.enabled = !seated;
+    }
+
+    /// <summary>
+    /// At the helm: the body stays in the seat and the input flies the ship. Changed commands are
+    /// scheduled a little ahead by the server; the helm's own client predicts the same so the
+    /// ship answers its controls right away.
+    /// </summary>
+    private void SimulateHelm(ShipPlayerInput data, ReplicateState state)
+    {
+        ShipHelm helm = ShipHelm.ForShip(_seatTarget);
+        if (helm == null)
+        {
+            LeaveSeat(placeBody: false);
+            return;
+        }
+
+        SetFrame(_seatTarget);
+        _mode = MoveMode.Seated;
+        _attached = false;
+        _body.position = helm.SeatLocal;
+        _body.rotation = Quaternion.identity;
+
+        byte sequence = data.HelmSequence;
+        if (sequence == 0)
+            return;
+        long tick = ShipClock.SimTick + helm.CommandDelayTicks;
+        if (IsServerStarted)
+        {
+            if (state.ContainsCreated() && sequence != _serverHelmSequence)
+            {
+                _serverHelmSequence = sequence;
+                helm.Schedule(tick, data.Helm, sequence);
+            }
+        }
+        else if (IsOwner && !state.ContainsReplayed() && sequence != _predictedHelmSequence)
+        {
+            _predictedHelmSequence = sequence;
+            helm.Ship.ApplyCommand(tick, data.Helm, sequence, predicted: true);
+        }
+    }
+
+    /// <summary>
+    /// In a fighter: the input flies it, and the body rides along in the cockpit.
+    /// </summary>
+    private void SimulateFighter(ShipPlayerInput data, long tick, float delta)
+    {
+        Fighter fighter = Fighter.Get(_seatTarget);
+        if (fighter == null)
+        {
+            LeaveSeat(placeBody: false);
+            return;
+        }
+
+        _mode = MoveMode.Seated;
+        _attached = false;
+        fighter.BeginPiloting(this);
+        // A/D roll (A counter-clockwise), Q/E strafe (Q left), Z/C yaw, W/S forward/back.
+        FighterInput input = new()
+        {
+            Thrust = new Vector3(-data.Roll, (data.Up ? 1f : 0f) - (data.Down ? 1f : 0f), data.Move.y),
+            Yaw = data.Yaw,
+            Roll = -data.Move.x,
+            Aim = data.Steer,
+            Brake = data.Brake,
+            EngineToggle = data.EngineToggle,
+            Release = data.Release,
+        };
+        fighter.Simulate(input, tick, delta);
+        FollowFighter(fighter);
+    }
+
+    private void FollowFighter(Fighter fighter)
+    {
+        SetFrame(fighter.Frame);
+        _body.position = fighter.Position + fighter.Rotation * fighter.CockpitPosition;
+        _body.rotation = fighter.Rotation;
+    }
+    #endregion
 
     /// <summary>
     /// Look rotation expressed in the body's current frame. Usually the client looked from the
@@ -688,6 +1066,8 @@ public class ShipPlayer : NetworkBehaviour
     {
         _body.position = position;
         _body.rotation = rotation;
+        if (_body.isKinematic)
+            return;
         _body.linearVelocity = velocity;
         _body.angularVelocity = Vector3.zero;
     }
@@ -709,17 +1089,39 @@ public class ShipPlayer : NetworkBehaviour
             Velocity = _body.linearVelocity,
             BootsOn = _bootsOn,
             Attached = _attached,
+            Seat = _seat,
+            SeatTarget = _seatTarget,
         };
+        Fighter fighter = _seat == PlayerSeat.Fighter ? Fighter.Get(_seatTarget) : null;
+        if (fighter != null)
+            state.Fighter = fighter.GetState();
         ReconcileState(state);
     }
 
     [Reconcile]
     private void ReconcileState(ShipPlayerState data, Channel channel = Channel.Unreliable)
     {
+        // Out of a fighter (or into another): it parks until its pilot's state says otherwise.
+        if (_seat == PlayerSeat.Fighter && (data.Seat != PlayerSeat.Fighter || data.SeatTarget != _seatTarget))
+            Fighter.Get(_seatTarget)?.EndPiloting(this);
+
+        _seat = data.Seat;
+        _seatTarget = data.SeatTarget;
+        SetSeated(_seat != PlayerSeat.None);
         SetFrame(data.Frame);
         SetBody(data.Position, IsValid(data.Rotation) ? data.Rotation : Quaternion.identity, data.Velocity);
         _bootsOn = data.BootsOn;
         _attached = data.Attached;
+
+        if (_seat == PlayerSeat.Fighter)
+        {
+            Fighter fighter = Fighter.Get(_seatTarget);
+            if (fighter != null)
+            {
+                fighter.BeginPiloting(this);
+                fighter.SetState(data.Fighter);
+            }
+        }
     }
 
     private void PredictionManager_OnPostReconcile(uint clientTick, uint serverTick)
@@ -734,6 +1136,8 @@ public class ShipPlayer : NetworkBehaviour
         Position = _body.position,
         Rotation = _body.rotation,
         Mode = _mode,
+        Seat = _seat,
+        SeatTarget = _seatTarget,
     };
 
     #region Rendering.
@@ -768,8 +1172,25 @@ public class ShipPlayer : NetworkBehaviour
 
         transform.SetPositionAndRotation(position, rotation);
 
-        if (IsOwner && _camera != null)
+        // In a fighter the body is out of sight in the cockpit.
+        bool visible = _current.Seat != PlayerSeat.Fighter;
+        if (_renderers == null)
+            _renderers = GetComponentsInChildren<Renderer>();
+        foreach (Renderer r in _renderers)
+            r.enabled = visible;
+
+        if (!IsOwner || _camera == null)
+            return;
+        Fighter fighter = _current.Seat == PlayerSeat.Fighter ? Fighter.Get(_current.SeatTarget) : null;
+        if (fighter != null)
+        {
+            fighter.GetRenderPose(out Vector3 fighterPos, out Quaternion fighterRot);
+            _camera.SetPositionAndRotation(fighterPos + fighterRot * fighter.CockpitPosition, _lookWorld);
+        }
+        else
+        {
             _camera.SetPositionAndRotation(position + rotation * (Vector3.up * _eyeHeight), _lookWorld);
+        }
     }
 
     /// <summary>
@@ -779,13 +1200,7 @@ public class ShipPlayer : NetworkBehaviour
     {
         position = snapshot.Position;
         rotation = snapshot.Rotation;
-        ShipFrame ship = ShipFrame.Get(snapshot.Frame);
-        if (ship == null)
-            return;
-
-        ship.GetPose(renderTick, out Vector3 shipPos, out Quaternion shipRot);
-        position = shipPos + shipRot * position;
-        rotation = shipRot * rotation;
+        ShipFrame.FrameToWorld(snapshot.Frame, renderTick, ref position, ref rotation);
     }
 
     private void OnGUI()
@@ -793,11 +1208,27 @@ public class ShipPlayer : NetworkBehaviour
         if (!IsOwner || _body == null)
             return;
 
-        string frame = _current.Frame == WorldFrame ? "Space" : $"Ship {_current.Frame}";
-        string boots = _bootsOn ? (_attached ? "ON (attached)" : "ON") : "off";
-        GUI.Label(new Rect(10f, Screen.height - 50f, 900f, 45f),
-            $"{frame} | {_current.Mode} | Boots {boots}\n" +
-            "WASD move  Space jump/up  Ctrl down  Q/E roll  Shift sprint/brake  B boots  Esc cursor");
+        string text;
+        switch (_current.Seat)
+        {
+            case PlayerSeat.Helm:
+                ShipFrame ship = ShipFrame.Get(_current.SeatTarget);
+                float speed = ship == null ? 0f : ship.GetState(ShipClock.SimTick).Velocity.magnitude;
+                text = $"HELM | Throttle {_helmThrottle:0.0} m/s | Speed {speed:0.0} m/s\n" +
+                    "W/S throttle  Shift all stop  A/D yaw  Space/Ctrl pitch  Q/E roll  Mouse look  F leave";
+                break;
+            case PlayerSeat.Fighter:
+                Fighter fighter = Fighter.Get(_current.SeatTarget);
+                text = fighter == null ? "" : fighter.GetStatusText();
+                break;
+            default:
+                string frame = _current.Frame == WorldFrame ? "Space" : $"Ship {_current.Frame}";
+                string boots = _bootsOn ? (_attached ? "ON (attached)" : "ON") : "off";
+                text = $"{frame} | {_current.Mode} | Boots {boots}\n" +
+                    "WASD move  Space jump/up  Ctrl down  Q/E roll  Shift sprint/brake  B boots  F use helm/fighter  Esc cursor";
+                break;
+        }
+        GUI.Label(new Rect(10f, Screen.height - 65f, 1000f, 60f), text);
     }
     #endregion
 }
